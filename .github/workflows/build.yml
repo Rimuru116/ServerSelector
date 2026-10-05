@@ -1,0 +1,908 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Create project files
+        run: |
+          set -e
+          mkdir -p app/src/main/java/com/example/serverselector
+          mkdir -p app/src/test/java/com/example/serverselector
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "ServerSelector"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.20" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.20" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+
+          android {
+              namespace = "com.example.serverselector"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.serverselector"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildFeatures { compose = true }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              val composeBom = platform("androidx.compose:compose-bom:2024.09.00")
+              implementation(composeBom)
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-compose:1.9.2")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.material3:material3")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+
+              testImplementation("junit:junit:4.13.2")
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="Server Selector"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".ServerVpnService"
+                      android:exported="false"
+                      android:foregroundServiceType="systemExempted"
+                      android:permission="android.permission.BIND_VPN_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.net.VpnService" />
+                      </intent-filter>
+                  </service>
+
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/example/serverselector/IpFilterLogic.kt <<'EOF'
+          package com.example.serverselector
+
+          /**
+           * IPv4 CIDR-блок. Поддерживает "91.218.162.193", "91.218.162.193/32", "91.218.162.0/24".
+           */
+          data class Cidr(val network: Long, val prefix: Int) {
+
+              private val mask: Long
+                  get() = if (prefix == 0) 0L else (0xFFFFFFFFL shl (32 - prefix)) and 0xFFFFFFFFL
+
+              fun contains(ip: Long): Boolean = (ip and mask) == (network and mask)
+
+              fun contains(ip: String): Boolean = contains(ipToLong(ip))
+
+              /** Адрес сети в виде строки, например "91.218.162.0" — нужен для Builder.addRoute(). */
+              fun networkString(): String = longToIp(network and mask)
+
+              override fun toString(): String = "${networkString()}/$prefix"
+
+              companion object {
+                  fun parse(text: String): Cidr {
+                      val value = text.trim()
+                      val parts = value.split("/")
+                      require(parts.size in 1..2) { "Неверный CIDR: $text" }
+                      val ip = ipToLong(parts[0])
+                      val prefix = if (parts.size == 2) {
+                          parts[1].toIntOrNull() ?: throw IllegalArgumentException("Неверный префикс: $text")
+                      } else 32
+                      require(prefix in 0..32) { "Префикс должен быть 0..32: $text" }
+                      return Cidr(ip, prefix)
+                  }
+
+                  fun ipToLong(ip: String): Long {
+                      val octets = ip.trim().split(".")
+                      require(octets.size == 4) { "Неверный IPv4: $ip" }
+                      var result = 0L
+                      for (o in octets) {
+                          val n = o.toIntOrNull() ?: throw IllegalArgumentException("Неверный IPv4: $ip")
+                          require(n in 0..255) { "Неверный IPv4: $ip" }
+                          result = (result shl 8) or n.toLong()
+                      }
+                      return result
+                  }
+
+                  fun longToIp(value: Long): String =
+                      "${(value ushr 24) and 0xFF}.${(value ushr 16) and 0xFF}.${(value ushr 8) and 0xFF}.${value and 0xFF}"
+              }
+          }
+
+          /**
+           * Логика решения "пропустить / сбросить" для IP-пакета.
+           *
+           * Порядок правил:
+           *  1. Адрес входит в allowedCidrs (выбранный сервер)        -> true  (пропустить)
+           *  2. Адрес входит в blockedCidrs (остальные серверы списка) -> false (сбросить)
+           *  3. Любой другой адрес (обычные сайты)                     -> true  (не ломаем интернет)
+           */
+          class IpFilterLogic(
+              allowedCidrs: List<String>,
+              blockedCidrs: List<String>
+          ) {
+              private val allowed: List<Cidr> = allowedCidrs.map { Cidr.parse(it) }
+              private val blocked: List<Cidr> = blockedCidrs.map { Cidr.parse(it) }
+
+              fun isIpAllowed(ip: String): Boolean = isAllowed(Cidr.ipToLong(ip))
+
+              fun isAllowed(dst: Long): Boolean {
+                  if (allowed.any { it.contains(dst) }) return true
+                  if (blocked.any { it.contains(dst) }) return false
+                  return true
+              }
+
+              /**
+               * Разбирает заголовок IPv4-пакета и решает его судьбу по адресу назначения (байты 16..19).
+               * IPv6 пропускается (true). Битый/короткий IPv4-пакет сбрасывается (false).
+               */
+              fun isPacketAllowed(packet: ByteArray, length: Int = packet.size): Boolean {
+                  if (length < 1) return false
+                  val version = (packet[0].toInt() ushr 4) and 0x0F
+                  if (version != 4) return true
+                  if (length < 20) return false
+                  val dst = ((packet[16].toLong() and 0xFF) shl 24) or
+                          ((packet[17].toLong() and 0xFF) shl 16) or
+                          ((packet[18].toLong() and 0xFF) shl 8) or
+                          (packet[19].toLong() and 0xFF)
+                  return isAllowed(dst)
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/example/serverselector/ServerVpnService.kt <<'EOF'
+          package com.example.serverselector
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.net.VpnService
+          import android.os.Build
+          import android.os.ParcelFileDescriptor
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import kotlinx.coroutines.flow.update
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
+          import java.io.IOException
+
+          data class ServerItem(
+              val id: String,
+              val name: String,
+              val cidr: String,   // подсеть/адрес сервера для фильтра
+              val host: String    // адрес для ping/traceroute
+          )
+
+          /**
+           * ====== СПИСОК СЕРВЕРОВ ======
+           * Вставьте сюда реальные IP-адреса / подсети.
+           * cidr: "A.B.C.D" (= /32) или "A.B.C.0/24".
+           * Подсети в списке НЕ должны пересекаться друг с другом.
+           */
+          val SERVERS: List<ServerItem> = listOf(
+              // ВСТАВИТЬ РЕАЛЬНЫЙ IP: 1-й сервер (сейчас — ваш IP 91.218.162.193)
+              ServerItem("s1", "Сервер 1", "91.218.162.193/32", "91.218.162.193"),
+              // ВСТАВИТЬ РЕАЛЬНЫЙ IP/ПОДСЕТЬ: 2-й сервер (203.0.113.0/24 — тестовый диапазон-заглушка)
+              ServerItem("s2", "Сервер 2", "203.0.113.0/24", "203.0.113.10"),
+              // ВСТАВИТЬ РЕАЛЬНЫЙ IP/ПОДСЕТЬ: 3-й сервер (198.51.100.0/24 — тестовый диапазон-заглушка)
+              ServerItem("s3", "Сервер 3", "198.51.100.0/24", "198.51.100.10")
+          )
+
+          /** Дополнительные адреса/подсети, которые нужно блокировать всегда (черный список). */
+          val EXTRA_BLOCKED_CIDRS: List<String> = listOf(
+              // ВСТАВИТЬ РЕАЛЬНЫЙ IP В ЧЕРНЫЙ СПИСОК, например: "192.0.2.0/24"
+          )
+
+          /** Состояние сервиса для UI. */
+          object VpnState {
+              val running = MutableStateFlow(false)
+              val dropped = MutableStateFlow(0L)
+          }
+
+          /**
+           * Принцип работы:
+           * Builder.addRoute() добавляется ТОЛЬКО для заблокированных подсетей, поэтому в туннель (tun)
+           * попадает лишь трафик к ним. Всё остальное (выбранный сервер и обычные сайты) идёт мимо VPN
+           * напрямую, интернет не ломается. Каждый прочитанный из tun пакет проверяется IpFilterLogic:
+           * запрещённые сбрасываются (drop) и не записываются обратно.
+           */
+          class ServerVpnService : VpnService() {
+
+              private var tun: ParcelFileDescriptor? = null
+              @Volatile private var worker: Thread? = null
+              @Volatile private var running = false
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  when (intent?.action) {
+                      ACTION_STOP -> {
+                          cleanup()
+                          stopForeground(STOP_FOREGROUND_REMOVE)
+                          stopSelf()
+                      }
+                      ACTION_START -> {
+                          val allowed = intent.getStringExtra(EXTRA_ALLOWED_CIDR)
+                          if (allowed == null) {
+                              stopSelf()
+                          } else {
+                              startVpn(allowed)
+                          }
+                      }
+                  }
+                  return START_NOT_STICKY
+              }
+
+              private fun startVpn(allowedCidr: String) {
+                  cleanup()
+
+                  val notification = buildNotification("Разрешён: $allowedCidr")
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED)
+                  } else {
+                      startForeground(NOTIF_ID, notification)
+                  }
+
+                  // Все серверы списка, кроме выбранного, + черный список
+                  val blocked: List<String> = SERVERS.map { it.cidr }.filter { it != allowedCidr } + EXTRA_BLOCKED_CIDRS
+                  val logic = IpFilterLogic(allowedCidrs = listOf(allowedCidr), blockedCidrs = blocked)
+
+                  val builder = Builder()
+                      .setSession("ServerSelector")
+                      .setMtu(1500)
+                      .setBlocking(true)
+                      .addAddress("10.77.0.2", 32)
+
+                  for (c in blocked) {
+                      val cidr = Cidr.parse(c)
+                      builder.addRoute(cidr.networkString(), cidr.prefix)
+                  }
+
+                  val pfd = try {
+                      builder.establish()
+                  } catch (e: Exception) {
+                      null
+                  }
+                  if (pfd == null) {
+                      stopForeground(STOP_FOREGROUND_REMOVE)
+                      stopSelf()
+                      return
+                  }
+
+                  tun = pfd
+                  running = true
+                  VpnState.dropped.value = 0L
+                  VpnState.running.value = true
+
+                  worker = Thread({ packetLoop(pfd, logic) }, "vpn-packet-loop").also { it.start() }
+              }
+
+              private fun packetLoop(pfd: ParcelFileDescriptor, logic: IpFilterLogic) {
+                  val input = FileInputStream(pfd.fileDescriptor)
+                  val output = FileOutputStream(pfd.fileDescriptor)
+                  val buffer = ByteArray(32767)
+                  try {
+                      while (running) {
+                          val n = input.read(buffer)
+                          if (n < 0) break
+                          if (n == 0) {
+                              Thread.sleep(10)
+                              continue
+                          }
+                          if (logic.isPacketAllowed(buffer, n)) {
+                              output.write(buffer, 0, n)          // разрешённый пакет
+                          } else {
+                              VpnState.dropped.update { it + 1 }  // drop: пакет не записывается
+                          }
+                      }
+                  } catch (e: IOException) {
+                      // tun закрыт — штатная остановка
+                  } catch (e: InterruptedException) {
+                      // остановка потока
+                  }
+              }
+
+              private fun cleanup() {
+                  running = false
+                  worker?.interrupt()
+                  worker = null
+                  try {
+                      tun?.close()
+                  } catch (e: IOException) {
+                      // игнорируем
+                  }
+                  tun = null
+                  VpnState.running.value = false
+              }
+
+              override fun onRevoke() {
+                  cleanup()
+                  stopForeground(STOP_FOREGROUND_REMOVE)
+                  stopSelf()
+                  super.onRevoke()
+              }
+
+              override fun onDestroy() {
+                  cleanup()
+                  super.onDestroy()
+              }
+
+              private fun buildNotification(text: String): Notification {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel(CHANNEL_ID, "IP-фильтр", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  return Notification.Builder(this, CHANNEL_ID)
+                      .setContentTitle("IP-фильтр активен")
+                      .setContentText(text)
+                      .setSmallIcon(android.R.drawable.ic_lock_lock)
+                      .setOngoing(true)
+                      .build()
+              }
+
+              companion object {
+                  const val ACTION_START = "com.example.serverselector.START"
+                  const val ACTION_STOP = "com.example.serverselector.STOP"
+                  const val EXTRA_ALLOWED_CIDR = "allowed_cidr"
+                  private const val CHANNEL_ID = "ip_filter"
+                  private const val NOTIF_ID = 1
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/example/serverselector/MainActivity.kt <<'EOF'
+          package com.example.serverselector
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.VpnService
+          import android.os.Build
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.PaddingValues
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.Spacer
+          import androidx.compose.foundation.layout.fillMaxSize
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.layout.systemBarsPadding
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.material3.Button
+          import androidx.compose.material3.ButtonDefaults
+          import androidx.compose.material3.Card
+          import androidx.compose.material3.CardDefaults
+          import androidx.compose.material3.MaterialTheme
+          import androidx.compose.material3.OutlinedButton
+          import androidx.compose.material3.OutlinedTextField
+          import androidx.compose.material3.RadioButton
+          import androidx.compose.material3.Surface
+          import androidx.compose.material3.Text
+          import androidx.compose.material3.darkColorScheme
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.collectAsState
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.mutableStateMapOf
+          import androidx.compose.runtime.mutableStateOf
+          import androidx.compose.runtime.remember
+          import androidx.compose.runtime.rememberCoroutineScope
+          import androidx.compose.runtime.saveable.rememberSaveable
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.text.font.FontFamily
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.core.content.ContextCompat
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.flow.Flow
+          import kotlinx.coroutines.flow.flow
+          import kotlinx.coroutines.flow.flowOn
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import java.net.InetSocketAddress
+          import java.net.Socket
+          import java.util.concurrent.TimeUnit
+          import kotlin.math.roundToInt
+
+          class MainActivity : ComponentActivity() {
+
+              private var pendingStart: (() -> Unit)? = null
+
+              private val vpnPermission = registerForActivityResult(
+                  ActivityResultContracts.StartActivityForResult()
+              ) { result ->
+                  if (result.resultCode == Activity.RESULT_OK) pendingStart?.invoke()
+                  pendingStart = null
+              }
+
+              private val notificationPermission = registerForActivityResult(
+                  ActivityResultContracts.RequestPermission()
+              ) { }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                      != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+                  }
+
+                  setContent {
+                      AppTheme {
+                          ServerSelectorScreen(
+                              onStart = { server -> startFilter(server) },
+                              onStop = { stopFilter() }
+                          )
+                      }
+                  }
+              }
+
+              private fun startFilter(server: ServerItem) {
+                  val launch: () -> Unit = {
+                      val intent = Intent(this, ServerVpnService::class.java)
+                          .setAction(ServerVpnService.ACTION_START)
+                          .putExtra(ServerVpnService.EXTRA_ALLOWED_CIDR, server.cidr)
+                      ContextCompat.startForegroundService(this, intent)
+                  }
+                  val prepare = VpnService.prepare(this)
+                  if (prepare != null) {
+                      pendingStart = launch
+                      vpnPermission.launch(prepare)
+                  } else {
+                      launch()
+                  }
+              }
+
+              private fun stopFilter() {
+                  startService(
+                      Intent(this, ServerVpnService::class.java).setAction(ServerVpnService.ACTION_STOP)
+                  )
+              }
+          }
+
+          // ───────────────────────────── Тема (Dark) ─────────────────────────────
+
+          @Composable
+          fun AppTheme(content: @Composable () -> Unit) {
+              MaterialTheme(
+                  colorScheme = darkColorScheme(
+                      primary = Color(0xFF4DD0B8),
+                      onPrimary = Color(0xFF00201A),
+                      background = Color(0xFF0D1117),
+                      onBackground = Color(0xFFE6EDF3),
+                      surface = Color(0xFF161B22),
+                      onSurface = Color(0xFFE6EDF3),
+                      surfaceVariant = Color(0xFF21262D),
+                      onSurfaceVariant = Color(0xFF9DA7B3),
+                      error = Color(0xFFFF6B6B)
+                  ),
+                  content = content
+              )
+          }
+
+          // ───────────────────────────── UI ─────────────────────────────
+
+          @Composable
+          fun ServerSelectorScreen(
+              onStart: (ServerItem) -> Unit,
+              onStop: () -> Unit
+          ) {
+              val running by VpnState.running.collectAsState()
+              val dropped by VpnState.dropped.collectAsState()
+
+              var selectedId by rememberSaveable { mutableStateOf(SERVERS.first().id) }
+              var traceHost by rememberSaveable { mutableStateOf("mobilelegends.com") }
+              var traceLog by remember { mutableStateOf("") }
+              var tracing by remember { mutableStateOf(false) }
+              val pings = remember { mutableStateMapOf<String, String>() }
+              val scope = rememberCoroutineScope()
+
+              fun runPing(server: ServerItem) {
+                  pings[server.id] = "…"
+                  scope.launch {
+                      val ms = NetTools.pingMs(server.host)
+                      pings[server.id] = if (ms == null) "нет ответа" else "$ms мс"
+                  }
+              }
+
+              fun runTrace(host: String) {
+                  if (tracing || host.isBlank()) return
+                  tracing = true
+                  traceLog = "traceroute → ${host.trim()}\n"
+                  scope.launch {
+                      NetTools.traceroute(host.trim()).collect { line -> traceLog += line + "\n" }
+                      tracing = false
+                  }
+              }
+
+              Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                  LazyColumn(
+                      modifier = Modifier.systemBarsPadding(),
+                      contentPadding = PaddingValues(16.dp),
+                      verticalArrangement = Arrangement.spacedBy(12.dp)
+                  ) {
+                      item {
+                          Text("Селектор серверов", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+                          Spacer(Modifier.height(4.dp))
+                          Text(
+                              text = if (running) "Фильтр активен · сброшено пакетов: $dropped" else "Фильтр остановлен",
+                              color = if (running) MaterialTheme.colorScheme.primary
+                              else MaterialTheme.colorScheme.onSurfaceVariant
+                          )
+                      }
+
+                      item {
+                          Button(
+                              onClick = {
+                                  if (running) onStop()
+                                  else onStart(SERVERS.first { it.id == selectedId })
+                              },
+                              modifier = Modifier
+                                  .fillMaxWidth()
+                                  .height(56.dp),
+                              colors = if (running) ButtonDefaults.buttonColors(
+                                  containerColor = MaterialTheme.colorScheme.error,
+                                  contentColor = Color.White
+                              ) else ButtonDefaults.buttonColors()
+                          ) {
+                              Text(if (running) "Остановить" else "Запустить", fontSize = 18.sp)
+                          }
+                      }
+
+                      items(SERVERS) { server ->
+                          Card(
+                              modifier = Modifier.fillMaxWidth(),
+                              colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+                          ) {
+                              Column(Modifier.padding(12.dp)) {
+                                  Row(verticalAlignment = Alignment.CenterVertically) {
+                                      RadioButton(
+                                          selected = selectedId == server.id,
+                                          onClick = { selectedId = server.id },
+                                          enabled = !running
+                                      )
+                                      Column(Modifier.weight(1f)) {
+                                          Text(server.name, fontWeight = FontWeight.SemiBold)
+                                          Text(
+                                              server.cidr,
+                                              fontSize = 13.sp,
+                                              fontFamily = FontFamily.Monospace,
+                                              color = MaterialTheme.colorScheme.onSurfaceVariant
+                                          )
+                                      }
+                                      Text(
+                                          text = pings[server.id] ?: "— мс",
+                                          fontFamily = FontFamily.Monospace,
+                                          color = MaterialTheme.colorScheme.primary
+                                      )
+                                  }
+                                  Spacer(Modifier.height(8.dp))
+                                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                      OutlinedButton(onClick = { runPing(server) }) { Text("Ping") }
+                                      OutlinedButton(
+                                          onClick = {
+                                              traceHost = server.host
+                                              runTrace(server.host)
+                                          },
+                                          enabled = !tracing
+                                      ) { Text("Traceroute") }
+                                      OutlinedButton(
+                                          onClick = { selectedId = server.id },
+                                          enabled = !running && selectedId != server.id
+                                      ) { Text(if (selectedId == server.id) "Выбран" else "Выбрать") }
+                                  }
+                              }
+                          }
+                      }
+
+                      item {
+                          Card(
+                              modifier = Modifier.fillMaxWidth(),
+                              colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+                          ) {
+                              Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                  Text("Traceroute", fontWeight = FontWeight.SemiBold)
+                                  OutlinedTextField(
+                                      value = traceHost,
+                                      onValueChange = { traceHost = it },
+                                      label = { Text("Хост / IP") },
+                                      singleLine = true,
+                                      modifier = Modifier.fillMaxWidth()
+                                  )
+                                  Button(
+                                      onClick = { runTrace(traceHost) },
+                                      enabled = !tracing,
+                                      modifier = Modifier.fillMaxWidth()
+                                  ) { Text(if (tracing) "Идёт трассировка…" else "Запустить traceroute") }
+                                  if (traceLog.isNotEmpty()) {
+                                      Text(
+                                          text = traceLog,
+                                          fontFamily = FontFamily.Monospace,
+                                          fontSize = 12.sp,
+                                          color = MaterialTheme.colorScheme.onSurface
+                                      )
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+
+          // ───────────────────────────── Ping / Traceroute ─────────────────────────────
+
+          /**
+           * Без root raw-ICMP недоступен, поэтому используется системная утилита /system/bin/ping
+           * (ключ -t задаёт TTL для traceroute). Если ping недоступен — запасной вариант TCP-connect.
+           */
+          object NetTools {
+
+              private fun runPing(host: String, ttl: Int?): Pair<String, Long> {
+                  val cmd = mutableListOf("/system/bin/ping", "-c", "1", "-W", "2", "-w", "3")
+                  if (ttl != null) {
+                      cmd.add("-t")
+                      cmd.add(ttl.toString())
+                  }
+                  cmd.add(host)
+                  val start = System.nanoTime()
+                  return try {
+                      val process = ProcessBuilder(cmd).redirectErrorStream(true).start()
+                      val output = process.inputStream.bufferedReader().readText()
+                      process.waitFor(5, TimeUnit.SECONDS)
+                      output to (System.nanoTime() - start) / 1_000_000
+                  } catch (e: Exception) {
+                      "" to 0L
+                  }
+              }
+
+              private val timeRegex = Regex("time[=<]([0-9.]+)")
+
+              /** Пинг в миллисекундах или null, если ответа нет. */
+              suspend fun pingMs(host: String): Int? = withContext(Dispatchers.IO) {
+                  val (output, _) = runPing(host, null)
+                  val icmp = timeRegex.find(output)?.groupValues?.get(1)?.toDoubleOrNull()
+                  if (icmp != null) return@withContext icmp.roundToInt()
+
+                  // Запасной вариант: время TCP-соединения
+                  for (port in intArrayOf(443, 80)) {
+                      try {
+                          val t0 = System.nanoTime()
+                          Socket().use { s -> s.connect(InetSocketAddress(host, port), 2000) }
+                          return@withContext ((System.nanoTime() - t0) / 1_000_000).toInt()
+                      } catch (e: Exception) {
+                          // пробуем следующий порт
+                      }
+                  }
+                  null
+              }
+
+              /** Построчный traceroute (до maxHops прыжков). */
+              fun traceroute(host: String, maxHops: Int = 20): Flow<String> = flow {
+                  for (ttl in 1..maxHops) {
+                      val (output, elapsed) = runPing(host, ttl)
+
+                      if (output.contains("unknown host", ignoreCase = true) ||
+                          output.contains("Name or service not known", ignoreCase = true)
+                      ) {
+                          emit("Хост не найден: $host")
+                          return@flow
+                      }
+
+                      val addr = Regex("[Ff]rom\\s+(\\S+)").find(output)?.groupValues?.get(1)?.trimEnd(':')
+                      val reached = output.contains("bytes from")
+                      val ms = timeRegex.find(output)?.groupValues?.get(1)?.toDoubleOrNull()?.roundToInt()
+                          ?: elapsed.toInt()
+
+                      emit(if (addr == null) "%2d  *".format(ttl) else "%2d  %-18s %d мс".format(ttl, addr, ms))
+
+                      if (reached) {
+                          emit("Достигнут: $host")
+                          return@flow
+                      }
+                  }
+                  emit("Достигнут лимит: $maxHops прыжков")
+              }.flowOn(Dispatchers.IO)
+          }
+          EOF
+
+          cat > app/src/test/java/com/example/serverselector/IpFilterLogicTest.kt <<'EOF'
+          package com.example.serverselector
+
+          import org.junit.Assert.assertEquals
+          import org.junit.Assert.assertFalse
+          import org.junit.Assert.assertTrue
+          import org.junit.Test
+
+          class IpFilterLogicTest {
+
+              // Выбранный сервер — 91.218.162.193; остальные серверы и один одиночный адрес — в черном списке
+              private val logic = IpFilterLogic(
+                  allowedCidrs = listOf("91.218.162.193/32"),
+                  blockedCidrs = listOf("203.0.113.0/24", "198.51.100.0/24", "198.51.100.7")
+              )
+
+              /** Собирает минимальный IPv4-заголовок (20 байт) с нужным адресом назначения. */
+              private fun packetTo(dst: String): ByteArray {
+                  val p = ByteArray(20)
+                  p[0] = 0x45.toByte() // version 4, IHL 5
+                  val o = dst.split(".").map { it.toInt() }
+                  p[16] = o[0].toByte()
+                  p[17] = o[1].toByte()
+                  p[18] = o[2].toByte()
+                  p[19] = o[3].toByte()
+                  return p
+              }
+
+              @Test
+              fun testAllowedIpPasses() {
+                  assertTrue(logic.isPacketAllowed(packetTo("91.218.162.193")))
+                  assertTrue(logic.isIpAllowed("91.218.162.193"))
+              }
+
+              @Test
+              fun testBlockedIpDrops() {
+                  assertFalse(logic.isPacketAllowed(packetTo("198.51.100.7")))
+                  assertFalse(logic.isPacketAllowed(packetTo("203.0.113.50")))
+                  assertFalse(logic.isIpAllowed("198.51.100.7"))
+              }
+
+              @Test
+              fun testCidrMatching() {
+                  // Границы подсети 203.0.113.0/24
+                  assertFalse(logic.isPacketAllowed(packetTo("203.0.113.0")))
+                  assertFalse(logic.isPacketAllowed(packetTo("203.0.113.1")))
+                  assertFalse(logic.isPacketAllowed(packetTo("203.0.113.255")))
+                  // Соседние подсети не затронуты
+                  assertTrue(logic.isPacketAllowed(packetTo("203.0.114.1")))
+                  assertTrue(logic.isPacketAllowed(packetTo("203.0.112.255")))
+
+                  // Проверка вхождения 91.218.162.193 в 91.218.162.0/24 и /32
+                  assertTrue(Cidr.parse("91.218.162.0/24").contains("91.218.162.193"))
+                  assertTrue(Cidr.parse("91.218.162.193").contains("91.218.162.193"))
+                  assertFalse(Cidr.parse("91.218.162.0/24").contains("91.218.163.1"))
+                  assertTrue(Cidr.parse("0.0.0.0/0").contains("8.8.8.8"))
+
+                  // Если подсеть 91.218.162.0/24 заблокирована и не разрешена — адрес сбрасывается
+                  val blockSubnet = IpFilterLogic(
+                      allowedCidrs = emptyList(),
+                      blockedCidrs = listOf("91.218.162.0/24")
+                  )
+                  assertFalse(blockSubnet.isPacketAllowed(packetTo("91.218.162.193")))
+                  assertEquals("91.218.162.0", Cidr.parse("91.218.162.193/24").networkString())
+              }
+
+              @Test
+              fun testUnknownIpPasses() {
+                  assertTrue(logic.isPacketAllowed(packetTo("8.8.8.8")))
+                  assertTrue(logic.isPacketAllowed(packetTo("1.1.1.1")))
+                  assertTrue(logic.isPacketAllowed(packetTo("142.250.74.46")))
+                  assertTrue(logic.isIpAllowed("93.184.216.34"))
+              }
+
+              @Test
+              fun testMalformedAndIpv6() {
+                  assertFalse(logic.isPacketAllowed(ByteArray(10).also { it[0] = 0x45.toByte() }, 10)) // обрезанный IPv4
+                  assertFalse(logic.isPacketAllowed(ByteArray(0), 0))
+                  assertTrue(logic.isPacketAllowed(ByteArray(40).also { it[0] = 0x60.toByte() }))       // IPv6 пропускается
+              }
+          }
+          EOF
+
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Unit tests
+        continue-on-error: true
+        run: gradle testDebugUnitTest --no-daemon
+
+      - name: Rename APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk ServerSelector.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ServerSelector-apk
+          path: ServerSelector.apk
+
+      - name: Publish release with APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" ServerSelector.apk \
+            --title "Build ${{ github.run_number }}" \
+            --notes "Debug APK"
